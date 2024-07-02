@@ -1,0 +1,8 @@
+/target
+data/
+moredata/
+.venv
+data.tmp
+target
+.DS_store
+__pycache__
