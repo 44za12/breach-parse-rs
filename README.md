@@ -14,7 +14,7 @@ Breach Pars is a powerful and efficient tool designed to search through large da
 
 Breach-Parse is designed to handle massive datasets efficiently. For example, it can search through more than 3 billion lines of compressed data (approximately 19 GB) and deliver results in about 45 seconds. 
 
-![GIF showing running the tool and its speed](#)
+[![asciicast](https://asciinema.org/a/ROQDk5AAw62wynxCdgkQwTXjT.svg)](https://asciinema.org/a/ROQDk5AAw62wynxCdgkQwTXjT)
 
 ## Usage
 
@@ -76,10 +76,6 @@ Download the breach data using the provided torrent file in the repository:
 3. Once the download is complete, place the downloaded data in the cloned directory.
 
 Once the data is downloaded, you can use the tool without specifying the data location.
-
-## Running the Tool
-
-![GIF showing running the tool and its speed](#)
 
 ## How It Works
 
