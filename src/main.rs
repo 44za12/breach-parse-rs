@@ -1,11 +1,13 @@
-use aho_corasick::AhoCorasick;
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use bstr::ByteSlice;
 use clap::{App, Arg};
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fs::File;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use walkdir::WalkDir;
 use flate2::read::MultiGzDecoder;
@@ -96,31 +98,50 @@ fn process_email(keyword: &str, base_dir: &str) -> Vec<String> {
     }
     
     let file = File::open(&path).expect("Unable to open file");
-    let buf_reader = if path.ends_with(".gz") {
-        Box::new(BufReader::new(MultiGzDecoder::new(file))) as Box<dyn BufRead>
+    let mut reader: Box<dyn Read> = if path.ends_with(".gz") {
+        Box::new(MultiGzDecoder::new(file))
     } else {
-        Box::new(BufReader::new(ZstdDecoder::new(file).unwrap())) as Box<dyn BufRead>
+        Box::new(ZstdDecoder::new(file).unwrap())
     };
-    
-    buf_reader.lines()
-        .filter_map(Result::ok)
+
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer).unwrap();
+
+    buffer
+        .lines()
+        .par_bridge()
+        .map(|line| line.to_str_lossy().into_owned())
         .filter(|line| line.to_lowercase().starts_with(&keyword_lower))
         .collect()
 }
 
 fn process_file(path: &Path, ac: &AhoCorasick) -> Vec<String> {
-    let file = File::open(path).expect("Unable to open file");
-    let reader: Box<dyn BufRead> = if path.extension().and_then(|s| s.to_str()) == Some("gz") {
-        Box::new(BufReader::new(GzDecoder::new(file)))
-    } else if path.extension().and_then(|s| s.to_str()) == Some("zst") {
-        Box::new(BufReader::new(ZstdDecoder::new(file).unwrap()))
-    } else {
-        Box::new(BufReader::new(file))
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
     };
-    reader
-        .lines()
-        .filter_map(Result::ok)
-        .filter(|line| ac.find_iter(line).count() == ac.pattern_count())
+
+    let mut reader: Box<dyn Read> = if path.extension().and_then(|s| s.to_str()) == Some("gz") {
+        Box::new(GzDecoder::new(file))
+    } else if path.extension().and_then(|s| s.to_str()) == Some("zst") {
+        Box::new(ZstdDecoder::new(file).unwrap())
+    } else {
+        Box::new(file)
+    };
+
+    let mut buffer = Vec::new();
+    if reader.read_to_end(&mut buffer).is_err() {
+        return Vec::new();
+    }
+
+    buffer
+        .par_split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let matches: HashSet<usize> = ac.find_iter(line).map(|m| m.pattern()).collect();
+            matches.len() == ac.pattern_count()
+        })
+        .map(|line| String::from_utf8_lossy(line).into_owned())
         .collect()
 }
 
@@ -144,31 +165,19 @@ fn main() -> io::Result<()> {
     if let Some(keyword2) = config.keyword2 {
         patterns.push(keyword2);
     }
-    let ac = AhoCorasick::new(&patterns);
+    let ac = AhoCorasickBuilder::new().dfa(true).build(&patterns);
 
-    let files: Vec<_> = WalkDir::new(&config.breach_data_location)
+    let file_iterator = WalkDir::new(&config.breach_data_location)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
-        .collect();
+        .filter(|e| e.path().is_file());
 
-    let progress_bar = ProgressBar::new(files.len() as u64);
-    progress_bar.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} ({eta})")
-        .unwrap()
-        .progress_chars("#>-"));
-
-    let results: Vec<_> = files.into_par_iter()
-        .map(|entry| {
-            progress_bar.inc(1);
+    let results: Vec<String> = file_iterator
+        .par_bridge()
+        .flat_map(|entry| {
             process_file(entry.path(), &ac)
         })
-        .reduce(Vec::new, |mut a, b| {
-            a.extend(b);
-            a
-        });
-
-    progress_bar.finish_with_message("Processing complete.");
+        .collect();
 
     match config.output_file.as_ref() {
         "print" => {
