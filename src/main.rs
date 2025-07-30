@@ -2,7 +2,6 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use bstr::ByteSlice;
 use clap::{App, Arg};
 use flate2::read::GzDecoder;
-use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
@@ -11,7 +10,6 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use walkdir::WalkDir;
 use flate2::read::MultiGzDecoder;
-use zstd::stream::read::Decoder as ZstdDecoder;
 
 #[derive(Debug)]
 struct Config {
@@ -80,19 +78,19 @@ fn process_email(keyword: &str, base_dir: &str) -> Vec<String> {
 
         if i < 2 {
             let gz_path = format!("{}.gz", path);
-            let zst_path = format!("{}.zst", path);
+            let txt_path = format!("{}.txt", path);
             if fs::metadata(&gz_path).is_ok() {
                 path = gz_path;
                 break;
-            } else if fs::metadata(&zst_path).is_ok() {
-                path = zst_path;
+            } else if fs::metadata(&txt_path).is_ok() {
+                path = txt_path;
                 break;
             }
         } else {
             if fs::metadata(&format!("{}.gz", path)).is_ok() {
                 path.push_str(".gz");
             } else {
-                path.push_str(".zst");
+                path.push_str(".txt");
             }
         }
     }
@@ -101,7 +99,7 @@ fn process_email(keyword: &str, base_dir: &str) -> Vec<String> {
     let mut reader: Box<dyn Read> = if path.ends_with(".gz") {
         Box::new(MultiGzDecoder::new(file))
     } else {
-        Box::new(ZstdDecoder::new(file).unwrap())
+        Box::new(file)
     };
 
     let mut buffer = Vec::new();
@@ -123,8 +121,6 @@ fn process_file(path: &Path, ac: &AhoCorasick) -> Vec<String> {
 
     let mut reader: Box<dyn Read> = if path.extension().and_then(|s| s.to_str()) == Some("gz") {
         Box::new(GzDecoder::new(file))
-    } else if path.extension().and_then(|s| s.to_str()) == Some("zst") {
-        Box::new(ZstdDecoder::new(file).unwrap())
     } else {
         Box::new(file)
     };
