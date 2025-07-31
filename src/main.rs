@@ -10,6 +10,8 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use walkdir::WalkDir;
 use flate2::read::MultiGzDecoder;
+use indicatif::{ProgressBar, ProgressStyle};
+use zstd::stream::read::Decoder;
 
 #[derive(Debug)]
 struct Config {
@@ -54,7 +56,7 @@ fn parse_arguments() -> Config {
 
     let config = Config {
         keyword: matches.value_of("keyword").unwrap_or_default().to_string(),
-        keyword2: matches.value_of("keyword2").map(|s| s.to_string()),
+        keyword2: matches.value_of("second_keyword").map(|s| s.to_string()),
         output_file: matches.value_of("output_file").unwrap_or("print").to_string(),
         breach_data_location: matches.value_of("breach_data_location").unwrap().to_string(),
         email: matches.value_of("email").map(|s| s.to_string()),
@@ -78,9 +80,13 @@ fn process_email(keyword: &str, base_dir: &str) -> Vec<String> {
 
         if i < 2 {
             let gz_path = format!("{}.gz", path);
+            let zst_path = format!("{}.zst", path);
             let txt_path = format!("{}.txt", path);
             if fs::metadata(&gz_path).is_ok() {
                 path = gz_path;
+                break;
+            } else if fs::metadata(&zst_path).is_ok() {
+                path = zst_path;
                 break;
             } else if fs::metadata(&txt_path).is_ok() {
                 path = txt_path;
@@ -89,21 +95,34 @@ fn process_email(keyword: &str, base_dir: &str) -> Vec<String> {
         } else {
             if fs::metadata(&format!("{}.gz", path)).is_ok() {
                 path.push_str(".gz");
+            } else if fs::metadata(&format!("{}.zst", path)).is_ok() {
+                path.push_str(".zst");
             } else {
                 path.push_str(".txt");
             }
         }
     }
     
-    let file = File::open(&path).expect("Unable to open file");
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    
     let mut reader: Box<dyn Read> = if path.ends_with(".gz") {
         Box::new(MultiGzDecoder::new(file))
+    } else if path.ends_with(".zst") {
+        match Decoder::new(file) {
+            Ok(decoder) => Box::new(decoder),
+            Err(_) => return Vec::new(),
+        }
     } else {
         Box::new(file)
     };
 
     let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer).unwrap();
+    if reader.read_to_end(&mut buffer).is_err() {
+        return Vec::new();
+    }
 
     buffer
         .lines()
@@ -121,6 +140,11 @@ fn process_file(path: &Path, ac: &AhoCorasick) -> Vec<String> {
 
     let mut reader: Box<dyn Read> = if path.extension().and_then(|s| s.to_str()) == Some("gz") {
         Box::new(GzDecoder::new(file))
+    } else if path.extension().and_then(|s| s.to_str()) == Some("zst") {
+        match Decoder::new(file) {
+            Ok(decoder) => Box::new(decoder),
+            Err(_) => return Vec::new(),
+        }
     } else {
         Box::new(file)
     };
@@ -163,17 +187,31 @@ fn main() -> io::Result<()> {
     }
     let ac = AhoCorasickBuilder::new().dfa(true).build(&patterns);
 
-    let file_iterator = WalkDir::new(&config.breach_data_location)
+    // Collect all files first to get the total count for the progress bar
+    let files: Vec<_> = WalkDir::new(&config.breach_data_location)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file());
-
-    let results: Vec<String> = file_iterator
-        .par_bridge()
-        .flat_map(|entry| {
-            process_file(entry.path(), &ac)
-        })
+        .filter(|e| e.path().is_file())
         .collect();
+
+    let total_files = files.len();
+    let pb = ProgressBar::new(total_files as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+        .expect("Failed to set progress bar template")
+        .progress_chars("#>-"));
+
+    let results: Vec<String> = files
+        .into_par_iter()
+        .map(|entry| {
+            let result = process_file(entry.path(), &ac);
+            pb.inc(1);
+            result
+        })
+        .flat_map(|result| result)
+        .collect();
+
+    pb.finish_with_message("Search completed");
 
     match config.output_file.as_ref() {
         "print" => {
