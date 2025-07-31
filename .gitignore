@@ -6,3 +6,4 @@ data.tmp
 target
 .DS_store
 __pycache__
+*.tar.gz
