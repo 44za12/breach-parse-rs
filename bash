@@ -1,0 +1,1 @@
+time fd -t f -e zst . data.tmp | parallel -j$(nproc) 'zstd -d -c {} | rg -a -F "perfectaazar"'

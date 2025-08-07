@@ -1,25 +1,23 @@
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use bstr::ByteSlice;
 use clap::{App, Arg};
 use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use rayon::prelude::*;
-use std::collections::HashSet;
-use std::fs::File;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use walkdir::WalkDir;
-use flate2::read::MultiGzDecoder;
-use indicatif::{ProgressBar, ProgressStyle};
-use zstd::stream::read::Decoder;
+
+use crossbeam_channel::{bounded, Sender};
+use memchr::memmem::Finder;
+use memchr::{memchr, memrchr};
 use num_cpus;
-use memmap2::Mmap;
-use std::sync::Arc;
+use zstd::stream::read::Decoder;
 
 #[derive(Debug)]
 struct Config {
     keyword: String,
-    keyword2: Option<String>,
     output_file: String,
     breach_data_location: String,
     email: Option<String>,
@@ -30,38 +28,53 @@ fn parse_arguments() -> Config {
         .version("1.0")
         .author("Aazar")
         .about("Searches through breach data efficiently")
-        .arg(Arg::new("keyword")
-            .short('k')
-            .long("keyword")
-            .takes_value(true)
-            .required_unless_present("email")
-            .help("Primary keyword to search for"))
-        .arg(Arg::new("second_keyword")
-            .short('s')
-            .long("second_keyword")
-            .takes_value(true)
-            .help("Secondary keyword to search for"))
-        .arg(Arg::new("output_file")
-            .short('o')
-            .long("output_file")
-            .takes_value(true)
-            .default_value("print")
-            .help("File to output results or 'print' to output to console"))
-        .arg(Arg::new("email")
-            .takes_value(true)
-            .help("Email to search for directly"))
-        .arg(Arg::new("breach_data_location")
-            .long("breach_data_location")
-            .takes_value(true)
-            .default_value("data.tmp")
-            .help("Location of breach data"))
+        .arg(
+            Arg::new("keyword")
+                .short('k')
+                .long("keyword")
+                .takes_value(true)
+                .required_unless_present("email")
+                .help("Primary keyword to search for"),
+        )
+        .arg(
+            Arg::new("second_keyword")
+                .short('s')
+                .long("second_keyword")
+                .takes_value(true)
+                .help("Secondary keyword to search for"),
+        )
+        .arg(
+            Arg::new("output_file")
+                .short('o')
+                .long("output_file")
+                .takes_value(true)
+                .default_value("print")
+                .help("File to output results or 'print' to output to console"),
+        )
+        .arg(
+            Arg::new("email")
+                .takes_value(true)
+                .help("Email to search for directly"),
+        )
+        .arg(
+            Arg::new("breach_data_location")
+                .long("breach_data_location")
+                .takes_value(true)
+                .default_value("data.tmp")
+                .help("Location of breach data"),
+        )
         .get_matches();
 
     let config = Config {
         keyword: matches.value_of("keyword").unwrap_or_default().to_string(),
-        keyword2: matches.value_of("second_keyword").map(|s| s.to_string()),
-        output_file: matches.value_of("output_file").unwrap_or("print").to_string(),
-        breach_data_location: matches.value_of("breach_data_location").unwrap().to_string(),
+        output_file: matches
+            .value_of("output_file")
+            .unwrap_or("print")
+            .to_string(),
+        breach_data_location: matches
+            .value_of("breach_data_location")
+            .unwrap()
+            .to_string(),
         email: matches.value_of("email").map(|s| s.to_string()),
     };
 
@@ -105,12 +118,12 @@ fn process_email(keyword: &str, base_dir: &str) -> Vec<String> {
             }
         }
     }
-    
+
     let file = match File::open(&path) {
         Ok(file) => file,
         Err(_) => return Vec::new(),
     };
-    
+
     let mut reader: Box<dyn Read> = if path.ends_with(".gz") {
         Box::new(MultiGzDecoder::new(file))
     } else if path.ends_with(".zst") {
@@ -135,222 +148,219 @@ fn process_email(keyword: &str, base_dir: &str) -> Vec<String> {
         .collect()
 }
 
-fn process_file(path: &Path, ac: &AhoCorasick) -> Vec<String> {
-    // Try memory mapping first for better performance
+fn optimal_buffer_size(file: &File) -> usize {
+    if let Ok(metadata) = file.metadata() {
+        let file_size = metadata.len();
+
+        if file_size < 64 * 1024 {
+            8 * 1024
+        } else if file_size < 1024 * 1024 {
+            64 * 1024
+        } else if file_size < 100 * 1024 * 1024 {
+            512 * 1024
+        } else {
+            1024 * 1024
+        }
+    } else {
+        64 * 1024
+    }
+}
+
+#[inline]
+fn process_chunk_bytes_seq_parallel(
+    chunk: &[u8],
+    finder: &Finder,
+    tx: &Sender<Vec<u8>>,
+    stripe_target_bytes: usize,
+    stripe_headroom_bytes: usize,
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    let target = stripe_target_bytes;
+    let headroom = stripe_headroom_bytes;
+    let mut stripes: Vec<(usize, usize)> = Vec::with_capacity((chunk.len() / target.max(1)) + 1);
+    let mut start = 0usize;
+    while start < chunk.len() {
+        let mut end = (start + target).min(chunk.len());
+        if end < chunk.len() {
+            let search_end = (end + headroom).min(chunk.len());
+            if let Some(off) = memchr(b'\n', &chunk[end..search_end]) {
+                end += off + 1;
+            } else {
+                end = chunk.len();
+            }
+        }
+        stripes.push((start, end));
+        start = end;
+    }
+
+    stripes
+        .into_par_iter()
+        .map(|(s, e)| {
+            let mut out = Vec::with_capacity(128 * 1024);
+            let mut slice_start = s;
+            let mut last_emitted_start = usize::MAX;
+            let mut last_emitted_end = s;
+            while slice_start < e {
+                match finder.find(&chunk[slice_start..e]) {
+                    Some(rel) => {
+                        let abs = slice_start + rel;
+                        let line_start = memrchr(b'\n', &chunk[last_emitted_end..abs])
+                            .map(|i| last_emitted_end + i + 1)
+                            .unwrap_or(last_emitted_end);
+                        let line_end = memchr(b'\n', &chunk[abs..e]).map(|i| abs + i).unwrap_or(e);
+                        if !(line_start == last_emitted_start && line_end == last_emitted_end) {
+                            out.extend_from_slice(&chunk[line_start..line_end]);
+                            out.push(b'\n');
+                            last_emitted_start = line_start;
+                            last_emitted_end = line_end;
+                        }
+                        slice_start = line_end.saturating_add(1);
+                    }
+                    None => break,
+                }
+            }
+            out
+        })
+        .filter(|out| !out.is_empty())
+        .for_each(|out| {
+            let _ = tx.send(out);
+        });
+}
+
+fn process_file_stream(path: &Path, needle: &[u8], tx: &Sender<Vec<u8>>) {
+    let _finder = Finder::new(needle);
+
     if let Ok(file) = File::open(path) {
         if let Ok(metadata) = file.metadata() {
-            let file_size = metadata.len();
-            
-            // Use memory mapping for files larger than 1MB
-            if file_size > 1024 * 1024 {
-                if let Ok(mmap) = unsafe { Mmap::map(&file) } {
-                    let mmap_arc = Arc::new(mmap);
-                    
-                    // Process in chunks for very large files
-                    if file_size > 100 * 1024 * 1024 { // 100MB+
-                        return process_large_file_chunked(&mmap_arc, ac);
-                    } else {
-                        return process_memory_mapped_file(&mmap_arc, ac, path);
-                    }
-                }
-            }
-            
-            // Get optimal buffer size before creating the reader
+            let _file_size = metadata.len();
+
             let buffer_size = optimal_buffer_size(&file);
-            
-            // Fall back to regular file reading
-            let mut reader: Box<dyn Read> = if path.extension().and_then(|s| s.to_str()) == Some("gz") {
-                Box::new(GzDecoder::new(file))
-            } else if path.extension().and_then(|s| s.to_str()) == Some("zst") {
-                // Use multi-threaded zstd decoder
-                match Decoder::new(file) {
-                    Ok(decoder) => Box::new(decoder),
-                    Err(_) => return Vec::new(),
+            let mut reader: Box<dyn Read> =
+                if path.extension().and_then(|s| s.to_str()) == Some("gz") {
+                    Box::new(GzDecoder::new(file))
+                } else if path.extension().and_then(|s| s.to_str()) == Some("zst") {
+                    match Decoder::new(file) {
+                        Ok(decoder) => Box::new(decoder),
+                        Err(_) => return,
+                    }
+                } else {
+                    Box::new(file)
+                };
+
+            let finder = Finder::new(needle);
+            let mut carry: Vec<u8> = Vec::with_capacity(128 * 1024);
+            let mut buf = vec![0u8; buffer_size.max(8 * 1024 * 1024)];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut chunk = std::mem::take(&mut carry);
+                        chunk.extend_from_slice(&buf[..n]);
+                        if let Some(pos) = chunk.iter().rposition(|&b| b == b'\n') {
+                            let (process_bytes, rest) = chunk.split_at(pos + 1);
+                            process_chunk_bytes_seq_parallel(
+                                process_bytes,
+                                &finder,
+                                tx,
+                                4 * 1024 * 1024,
+                                1 * 1024 * 1024,
+                            );
+                            carry = rest.to_vec();
+                        } else {
+                            carry = chunk;
+                        }
+                    }
+                    Err(_) => break,
                 }
-            } else {
-                Box::new(file)
-            };
-
-            // Use optimized buffer size based on file metadata
-            let mut buffer = Vec::with_capacity(buffer_size);
-            if reader.read_to_end(&mut buffer).is_err() {
-                return Vec::new();
             }
-
-            return buffer
-                .par_split(|&b| b == b'\n')
-                .filter(|line| !line.is_empty())
-                .filter(|line| {
-                    let matches: HashSet<usize> = ac.find_iter(line).map(|m| m.pattern()).collect();
-                    matches.len() == ac.pattern_count()
-                })
-                .map(|line| String::from_utf8_lossy(line).into_owned())
-                .collect();
+            if !carry.is_empty() {
+                process_chunk_bytes_seq_parallel(
+                    &carry,
+                    &finder,
+                    tx,
+                    4 * 1024 * 1024,
+                    1 * 1024 * 1024,
+                );
+            }
+            return;
         }
     }
-    
-    // If we get here, we couldn't get file metadata
+
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(_) => return Vec::new(),
+        Err(_) => return,
     };
-
     let mut reader: Box<dyn Read> = if path.extension().and_then(|s| s.to_str()) == Some("gz") {
         Box::new(GzDecoder::new(file))
     } else if path.extension().and_then(|s| s.to_str()) == Some("zst") {
-        // Use multi-threaded zstd decoder
         match Decoder::new(file) {
             Ok(decoder) => Box::new(decoder),
-            Err(_) => return Vec::new(),
+            Err(_) => return,
         }
     } else {
         Box::new(file)
     };
 
-    // Use default buffer size
-    let mut buffer = Vec::with_capacity(64 * 1024);
-    if reader.read_to_end(&mut buffer).is_err() {
-        return Vec::new();
-    }
-
-    buffer
-        .par_split(|&b| b == b'\n')
-        .filter(|line| !line.is_empty())
-        .filter(|line| {
-            let matches: HashSet<usize> = ac.find_iter(line).map(|m| m.pattern()).collect();
-            matches.len() == ac.pattern_count()
-        })
-        .map(|line| String::from_utf8_lossy(line).into_owned())
-        .collect()
-}
-
-fn process_memory_mapped_file(mmap: &Arc<Mmap>, ac: &AhoCorasick, path: &Path) -> Vec<String> {
-    // For compressed files, we need to use a cursor to make the mmap readable
-    use std::io::Cursor;
-    
-    if path.extension().and_then(|s| s.to_str()) == Some("zst") {
-        // Handle zstd compressed memory-mapped files
-        let cursor = Cursor::new(&**mmap);
-        match Decoder::new(cursor) {
-            Ok(mut decoder) => {
-                let mut buffer = Vec::with_capacity(mmap.len() * 3); // zstd typically compresses 3:1
-                if decoder.read_to_end(&mut buffer).is_err() {
-                    return Vec::new();
+    let finder = Finder::new(needle);
+    let mut carry: Vec<u8> = Vec::with_capacity(128 * 1024);
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut chunk = std::mem::take(&mut carry);
+                chunk.extend_from_slice(&buf[..n]);
+                if let Some(pos) = chunk.iter().rposition(|&b| b == b'\n') {
+                    let (process_bytes, rest) = chunk.split_at(pos + 1);
+                    process_chunk_bytes_seq_parallel(
+                        process_bytes,
+                        &finder,
+                        tx,
+                        4 * 1024 * 1024,
+                        1 * 1024 * 1024,
+                    );
+                    carry = rest.to_vec();
+                } else {
+                    carry = chunk;
                 }
-                return buffer
-                    .par_split(|&b| b == b'\n')
-                    .filter(|line| !line.is_empty())
-                    .filter(|line| {
-                        let matches: HashSet<usize> = ac.find_iter(line).map(|m| m.pattern()).collect();
-                        matches.len() == ac.pattern_count()
-                    })
-                    .map(|line| String::from_utf8_lossy(line).into_owned())
-                    .collect();
-            },
-            Err(_) => return Vec::new(),
+            }
+            Err(_) => break,
         }
-    } else if path.extension().and_then(|s| s.to_str()) == Some("gz") {
-        // Handle gzip compressed memory-mapped files
-        let cursor = Cursor::new(&**mmap);
-        let mut decoder = GzDecoder::new(cursor);
-        let mut buffer = Vec::with_capacity(mmap.len() * 3); // gzip typically compresses 3:1
-        if decoder.read_to_end(&mut buffer).is_err() {
-            return Vec::new();
-        }
-        return buffer
-            .par_split(|&b| b == b'\n')
-            .filter(|line| !line.is_empty())
-            .filter(|line| {
-                let matches: HashSet<usize> = ac.find_iter(line).map(|m| m.pattern()).collect();
-                matches.len() == ac.pattern_count()
-            })
-            .map(|line| String::from_utf8_lossy(line).into_owned())
-            .collect();
-    } else {
-        // Uncompressed file - use the mmap directly
-        mmap
-            .par_split(|&b| b == b'\n')
-            .filter(|line| !line.is_empty())
-            .filter(|line| {
-                let matches: HashSet<usize> = ac.find_iter(line).map(|m| m.pattern()).collect();
-                matches.len() == ac.pattern_count()
-            })
-            .map(|line| String::from_utf8_lossy(line).into_owned())
-            .collect()
+    }
+    if !carry.is_empty() {
+        process_chunk_bytes_seq_parallel(&carry, &finder, tx, 4 * 1024 * 1024, 1 * 1024 * 1024);
     }
 }
-
-fn process_large_file_chunked(mmap: &Arc<Mmap>, ac: &AhoCorasick) -> Vec<String> {
-    let chunk_size = 50 * 1024 * 1024; // 50MB chunks
-    let mmap_clone = Arc::clone(mmap);
-    
-    (0..mmap.len())
-        .step_by(chunk_size)
-        .par_bridge()
-        .flat_map(|start| {
-            let end = std::cmp::min(start + chunk_size, mmap_clone.len());
-            let chunk = &mmap_clone[start..end];
-            
-            // Find the last newline to avoid splitting lines
-            let adjusted_end = if end < mmap_clone.len() {
-                chunk.iter().rposition(|&b| b == b'\n').map(|pos| start + pos + 1).unwrap_or(end)
-            } else {
-                end
-            };
-            
-            let adjusted_chunk = &mmap_clone[start..adjusted_end];
-            
-            adjusted_chunk
-                .par_split(|&b| b == b'\n')
-                .filter(|line| !line.is_empty())
-                .filter(|line| {
-                    let matches: HashSet<usize> = ac.find_iter(line).map(|m| m.pattern()).collect();
-                    matches.len() == ac.pattern_count()
-                })
-                .map(|line| String::from_utf8_lossy(line).into_owned())
-                .collect::<Vec<String>>()
-        })
-        .collect()
-}
-
-fn optimal_buffer_size(file: &File) -> usize {
-    if let Ok(metadata) = file.metadata() {
-        let file_size = metadata.len();
-        
-        // Optimal buffer size based on file size
-        if file_size < 64 * 1024 { // < 64KB
-            8 * 1024 // 8KB buffer
-        } else if file_size < 1024 * 1024 { // < 1MB
-            64 * 1024 // 64KB buffer
-        } else if file_size < 100 * 1024 * 1024 { // < 100MB
-            512 * 1024 // 512KB buffer
-        } else {
-            1024 * 1024 // 1MB buffer for very large files
-        }
-    } else {
-        64 * 1024 // Default 64KB buffer
-    }
-}
-
 fn main() -> io::Result<()> {
-    // Configure Rayon thread pool to use optimal number of threads
-    // Leave 1-2 cores for the system to remain responsive
     let total_cores = num_cpus::get();
-    let optimal_threads = std::cmp::max(1, total_cores.saturating_sub(2));
-    
-    // Initialize Rayon thread pool with optimal thread count
+    let optimal_threads = match std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(n) if n > 0 => n,
+        _ => total_cores.max(1),
+    };
+
     rayon::ThreadPoolBuilder::new()
         .num_threads(optimal_threads)
         .thread_name(|idx| format!("breach-parser-{}", idx))
         .build_global()
         .expect("Failed to initialize Rayon thread pool");
-    
-    println!("Using {} out of {} available CPU cores", optimal_threads, total_cores);
+
+    println!(
+        "Using {} out of {} available CPU cores",
+        optimal_threads, total_cores
+    );
 
     let config = parse_arguments();
 
     if !Path::new(&config.breach_data_location).is_dir() {
-        println!("Could not find a directory at {}", config.breach_data_location);
+        println!(
+            "Could not find a directory at {}",
+            config.breach_data_location
+        );
         std::process::exit(1);
     }
 
@@ -359,56 +369,50 @@ fn main() -> io::Result<()> {
         for line in results {
             println!("{}", line);
         }
-        return Ok(())
+        return Ok(());
     }
-
-    let mut patterns = vec![config.keyword];
-    if let Some(keyword2) = config.keyword2 {
-        patterns.push(keyword2);
-    }
-    let ac = AhoCorasickBuilder::new().dfa(true).build(&patterns);
-
-    // Collect all files first to get the total count for the progress bar
-    let files: Vec<_> = WalkDir::new(&config.breach_data_location)
+    let needle = config.keyword.into_bytes();
+    let walker = WalkDir::new(&config.breach_data_location)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
-        .collect();
+        .filter(|e| {
+            let p = e.path();
+            p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("zst")
+        });
+    let (tx, rx) = bounded::<Vec<u8>>(65536);
 
-    let total_files = files.len();
-    let pb = ProgressBar::new(total_files as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-        .expect("Failed to set progress bar template")
-        .progress_chars("#>-"));
-
-    let results: Vec<String> = files
-        .into_par_iter()
-        .map(|entry| {
-            let result = process_file(entry.path(), &ac);
-            pb.inc(1);
-            result
-        })
-        .flat_map(|result| result)
-        .collect();
-
-    pb.finish_with_message("Search completed");
-
-    match config.output_file.as_ref() {
-        "print" => {
-            println!("\nResults:\n");
-            for line in results {
-                println!("{}", line);
+    let output_mode = config.output_file.clone();
+    let writer_handle = std::thread::spawn(move || {
+        if output_mode == "print" {
+            let stdout = io::stdout();
+            let mut handle = BufWriter::with_capacity(8 * 1024 * 1024, stdout.lock());
+            while let Ok(line) = rx.recv() {
+                let _ = handle.write_all(&line);
             }
-        },
-        _ => {
-            let mut file = File::create(&config.output_file)?;
-            for line in results {
-                writeln!(file, "{}", line)?;
+            let _ = handle.flush();
+        } else {
+            if let Ok(file) = File::create(&output_mode) {
+                let mut handle = BufWriter::with_capacity(8 * 1024 * 1024, file);
+                while let Ok(line) = rx.recv() {
+                    let _ = handle.write_all(&line);
+                }
+                let _ = handle.flush();
+                println!("Results written to {}", output_mode);
+            } else {
+                let stdout = io::stdout();
+                let mut handle = BufWriter::with_capacity(8 * 1024 * 1024, stdout.lock());
+                while let Ok(line) = rx.recv() {
+                    let _ = handle.write_all(&line);
+                }
+                let _ = handle.flush();
             }
-            println!("Results written to {}", config.output_file);
-        },
-    }
+        }
+    });
+
+    walker.par_bridge().for_each_with(tx, |s, entry| {
+        process_file_stream(entry.path(), &needle, s);
+    });
+    let _ = writer_handle.join();
 
     Ok(())
 }
